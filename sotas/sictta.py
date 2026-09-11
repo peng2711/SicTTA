@@ -7,10 +7,16 @@ class TTA(nn.Module):
 
     Once tented, a model adapts itself by updating on every forward.
     """
-    def __init__(self, model, model_anchor):
+    def __init__(self, model, model_anchor, use_test_bn=True,
+                 use_sabe=True, use_sff=True):
         super().__init__()
         self.model = model
         self.model_anchor = model_anchor.eval()
+        # EXP0_REPRO: keep the released path as the default and expose only
+        # the paper Table 5 component switches needed by EXP-0.
+        self.use_test_bn = use_test_bn
+        self.use_sabe = use_sabe
+        self.use_sff = use_sff
 
         self.num_classes = 4
         self.max_lens = 40
@@ -38,6 +44,11 @@ class TTA(nn.Module):
         latent_model = latent_model[0].reshape(1*int(w/sup_pixel)*int(h/sup_pixel),c*sup_pixel*sup_pixel)
         latent_model_,fff, out_image, out_mask, len_pool = self.pool.get_pool_feature(latent_model,None,top_k = topk)
 
+        # EXP0_REPRO: SFF-only retains the source-BN path; SABE-only keeps
+        # the enhanced batch but discards the feature-fusion replacement.
+        if not self.use_sff:
+            latent_model_ = latent_model
+
         with torch.no_grad():
             if len_pool < topk:
                 threshold = len_pool / topk
@@ -55,13 +66,19 @@ class TTA(nn.Module):
             self.pool.update_mask_pool(model(x).softmax(1))
             self.pool.update_name_pool(names[0])
         if out_image is not None:
-            out_image = out_image[0]
-            x_hised = torch.cat((x, out_image), dim=0)
-            latent_model = model.get_feature(x_hised, loc = layer_fea)
+            if self.use_sabe:
+                out_image = out_image[0]
+                x_hised = torch.cat((x, out_image), dim=0)
+                latent_model = model.get_feature(x_hised, loc = layer_fea)
+            else:
+                # EXP0_REPRO: source-BN SFF does not construct an enhanced
+                # batch.  The current image is fused at the bottleneck only.
+                latent_model = model.get_feature(x, loc = layer_fea)
             latent_model_ = latent_model_.view(bad_num,int(w/sup_pixel),int(h/sup_pixel),c,sup_pixel,sup_pixel)
             latent_model_ = latent_model_.permute(0,3,1,4,2,5)
             latent_model_ = latent_model_.reshape(bad_num,c,w,h)
-            latent_model[0:1] = latent_model_
+            if self.use_sff:
+                latent_model[0:1] = latent_model_
             outputs2 = model.get_output(latent_model,loc = layer_fea)[0:1].softmax(1)
             return outputs2
         else:

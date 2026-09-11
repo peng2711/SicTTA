@@ -1,0 +1,32 @@
+# Python cache and local tooling
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS/editor metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local datasets and generated dataset manifests
+data/
+
+# Local checkpoints and training/adaptation outputs
+save_model/
+checkpoints/
+results/
+save_model/**/*.pth
+save_model/**/*.pt
+save_model/**/*.ckpt
+*.pth
+*.pt
+*.ckpt
+
+# Experiment logs and temporary files
+*.log
+*.tmp
+*.swp
