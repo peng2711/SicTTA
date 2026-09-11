@@ -24,6 +24,9 @@ class TTA(nn.Module):
         self.threshold = 0.9
         self.entropy_list = []
         self.pool = Prototype_Pool(0.1,class_num=self.num_classes,max = self.max_lens).cuda()
+        # EXP0_5_DIAG: read-only state populated from existing intermediates.
+        self.last_diag = {}
+        self.last_ccd_diag = {}
     def forward(self, x, names):
         for _ in range(1):
             outputs = self.forward_and_adapt(x, self.model, names)
@@ -43,6 +46,22 @@ class TTA(nn.Module):
         latent_model = latent_model.permute(0,2,4,1,3,5)
         latent_model = latent_model[0].reshape(1*int(w/sup_pixel)*int(h/sup_pixel),c*sup_pixel*sup_pixel)
         latent_model_,fff, out_image, out_mask, len_pool = self.pool.get_pool_feature(latent_model,None,top_k = topk)
+
+        # EXP0_5_DIAG: resolve names before any possible FIFO update shifts indices.
+        retrieval_diag = getattr(self.pool, 'last_retrieval_diag', {})
+        retrieval_names = []
+        for index in retrieval_diag.get('indices', []):
+            if index < len(self.pool.name_list):
+                retrieval_names.append(self.pool.name_list[index])
+            else:
+                retrieval_names.append(None)
+        history_before = len(self.entropy_list)
+        pool_before = {
+            'feature': int(self.pool.feature_bank.shape[0]),
+            'image': int(self.pool.image_bank.shape[0]),
+            'mask': int(self.pool.mask_bank.shape[0]),
+            'name': len(self.pool.name_list),
+        }
 
         # EXP0_REPRO: SFF-only retains the source-BN path; SABE-only keeps
         # the enhanced batch but discards the feature-fusion replacement.
@@ -79,10 +98,36 @@ class TTA(nn.Module):
             latent_model_ = latent_model_.reshape(bad_num,c,w,h)
             if self.use_sff:
                 latent_model[0:1] = latent_model_
-            outputs2 = model.get_output(latent_model,loc = layer_fea)[0:1].softmax(1)
-            return outputs2
+            output = model.get_output(latent_model,loc = layer_fea)[0:1].softmax(1)
         else:
-            return self.model_anchor(x)
+            output = self.model_anchor(x)
+
+        # EXP0_5_DIAG: no value below participates in the output or decision path.
+        pool_after = {
+            'feature': int(self.pool.feature_bank.shape[0]),
+            'image': int(self.pool.image_bank.shape[0]),
+            'mask': int(self.pool.mask_bank.shape[0]),
+            'name': len(self.pool.name_list),
+        }
+        ccd_diag = dict(self.last_ccd_diag)
+        self.last_diag = {
+            'ccd': ccd_diag.get('ccd'),
+            'ccd_threshold': ccd_diag.get('ccd_threshold'),
+            'ccd_margin': (ccd_diag.get('ccd_threshold') - ccd_diag.get('ccd')
+                           if ccd_diag.get('ccd_threshold') is not None else None),
+            'is_sft': bool(ccd_diag.get('fine', False)),
+            'ccd_history_len_before': history_before,
+            'ccd_history_len_after': len(self.entropy_list),
+            'pool_before': pool_before,
+            'pool_after': pool_after,
+            # EXP0_5_DIAG: distinguish an actual FIFO write from pool growth.
+            'memory_written': bool(ccd_diag.get('fine', False)),
+            'pool_grew': pool_after['name'] > pool_before['name'],
+            'retrieved_indices': list(retrieval_diag.get('indices', [])),
+            'retrieved_similarities': list(retrieval_diag.get('similarities', [])),
+            'retrieved_names': retrieval_names,
+        }
+        return output
 
     def entropy(self, p, prob=True, mean=True):
         if prob:
@@ -112,8 +157,24 @@ class TTA(nn.Module):
         ten_percent_index = int(len(sorted_list) * (1 - threshold))
         if ten_percent_index>0:
             ten_percent_min_value = sorted_list[:ten_percent_index][-1]
+            # EXP0_5_DIAG: retain the exact cutoff and decision already used below.
+            self.last_ccd_diag = {
+                'ccd': float(pred1_en.detach().cpu().item()),
+                'ccd_threshold': float(ten_percent_min_value.detach().cpu().item()
+                                       if torch.is_tensor(ten_percent_min_value)
+                                       else ten_percent_min_value),
+                'fine': bool(pred1_en <= ten_percent_min_value),
+                'history_len_after': len(entropy_list),
+            }
             return pred1_en <= ten_percent_min_value
         else:
+            # EXP0_5_DIAG: preserve the original false branch and record no cutoff.
+            self.last_ccd_diag = {
+                'ccd': float(pred1_en.detach().cpu().item()),
+                'ccd_threshold': None,
+                'fine': False,
+                'history_len_after': len(entropy_list),
+            }
             return False
 
 def configure_model(model):
@@ -143,6 +204,8 @@ class Prototype_Pool(nn.Module):
         self.image_bank = torch.tensor([]).cuda()
         self.mask_bank = torch.tensor([]).cuda()
         self.name_list = []
+        # EXP0_5_DIAG: retrieval metadata only; it is not consumed by the method.
+        self.last_retrieval_diag = {'indices': [], 'similarities': []}
     def get_pool_feature(self, x, mask, top_k = 5):
         if len(self.feature_bank)>0:
             cosine_similarities = torch.nn.functional.cosine_similarity(x.unsqueeze(1), self.feature_bank.unsqueeze(0), dim=2)
@@ -150,6 +213,11 @@ class Prototype_Pool(nn.Module):
                 outall = cosine_similarities.argsort(dim=1, descending=True)[:, :top_k]
             else:
                 outall = cosine_similarities.argsort(dim=1, descending=True)[:, :self.feature_bank.shape[0]]
+            # EXP0_5_DIAG: copy the exact selected indices/similarities.
+            self.last_retrieval_diag = {
+                'indices': outall[0].detach().cpu().tolist(),
+                'similarities': cosine_similarities[0][outall[0]].detach().cpu().tolist(),
+            }
             rates = cosine_similarities[0][outall[0]].mean(0)
             weight = rates * torch.exp(cosine_similarities[0][outall[0]]) / torch.sum(torch.exp(cosine_similarities[0][outall[0]]))
             x = x * (1-rates)
@@ -157,6 +225,8 @@ class Prototype_Pool(nn.Module):
                 x += self.feature_bank[outall[:,i]]*weight[i]
             return x,self.feature_bank[outall[:,]],self.image_bank[outall[:,]],self.mask_bank[outall[:,]], len(self.feature_bank)
         else:
+            # EXP0_5_DIAG: an empty pool has no retrieval ranks.
+            self.last_retrieval_diag = {'indices': [], 'similarities': []}
             return x,x,None,None, len(self.feature_bank)
 
     def update_feature_pool(self, feature):
