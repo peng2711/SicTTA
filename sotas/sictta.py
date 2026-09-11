@@ -32,6 +32,13 @@ class TTA(nn.Module):
         self.last_diag = {}
         self.last_ccd_diag = {}
         self.accepted_ccd_queue = []
+        # EXP2_DIAG: read-only current/query and pre-update memory prototypes.
+        self.last_class_prototypes = None
+        self.last_class_masses = None
+        self.last_class_memory_prototypes = None
+        self.last_class_memory_masses = None
+        self.last_class_memory_names = []
+        self.last_anchor_probability = None
 
     def reset_admission_history(self):
         self.entropy_list = []
@@ -48,6 +55,7 @@ class TTA(nn.Module):
         bad_num = x.shape[0]
         topk = self.topk
         latent_model = model.get_feature(x, loc = layer_fea)
+        latent_feature_map = latent_model
         b,c,w,h = latent_model.shape
         sup_pixel = w
         latent_model = latent_model.reshape(b,c,int(w/sup_pixel),sup_pixel,int(h/sup_pixel),sup_pixel)
@@ -70,6 +78,10 @@ class TTA(nn.Module):
             'mask': int(self.pool.mask_bank.shape[0]),
             'name': len(self.pool.name_list),
         }
+        # EXP2_DIAG: freeze the exact pre-update diagnostic memory view.
+        self.last_class_memory_prototypes = self.pool.class_prototype_bank
+        self.last_class_memory_masses = self.pool.class_mass_bank
+        self.last_class_memory_names = list(self.pool.name_list)
 
         # EXP0_REPRO: SFF-only retains the source-BN path; SABE-only keeps
         # the enhanced batch but discards the feature-fusion replacement.
@@ -87,11 +99,17 @@ class TTA(nn.Module):
             # Option 2 (default, consistent with paper): Use the source model (model_anchor) for CCD, which retains source BN statistics
             fine = self.get_fine_ccd(x, self.model_anchor.eval(), self.entropy_list, threshold=threshold)
 
+        # EXP2_DIAG: use the same pre-SABE/SFF feature map and anchor probability.
+        self.last_class_prototypes, self.last_class_masses = self._build_class_prototypes(
+            latent_feature_map, self.last_anchor_probability)
+
         if fine:
             self.pool.update_feature_pool(latent_model)
             self.pool.update_image_pool(x)
             self.pool.update_mask_pool(model(x).softmax(1))
             self.pool.update_name_pool(names[0])
+            self.pool.update_diagnostic_prototype_pool(self.last_class_prototypes,
+                                                       self.last_class_masses)
         if out_image is not None:
             if self.use_sabe:
                 out_image = out_image[0]
@@ -143,6 +161,8 @@ class TTA(nn.Module):
             'retrieved_indices': list(retrieval_diag.get('indices', [])),
             'retrieved_similarities': list(retrieval_diag.get('similarities', [])),
             'retrieved_names': retrieval_names,
+            'diagnostic_pool_size_before': len(self.last_class_memory_names),
+            'diagnostic_pool_size_after': len(self.pool.name_list),
         }
         return output
 
@@ -163,6 +183,7 @@ class TTA(nn.Module):
             for i in range(b):
                 with torch.no_grad():
                     pred1 = model_anchor(x[i:i+1]).softmax(1).detach()
+                self.last_anchor_probability = pred1
                 pred1 = pred1.permute(0,2,3,1)
                 pred1 = pred1.reshape(-1, pred1.size(3))
                 pred1_rand = torch.randperm(pred1.size(0))
@@ -202,6 +223,7 @@ class TTA(nn.Module):
             b,c,w,h = x.shape
             for i in range(b):
                 pred1 = model_anchor(x[i:i+1]).softmax(1).detach()
+                self.last_anchor_probability = pred1
                 pred1 = pred1.permute(0,2,3,1)
                 pred1 = pred1.reshape(-1, pred1.size(3))
                 pred1_rand = torch.randperm(pred1.size(0))
@@ -246,6 +268,21 @@ class TTA(nn.Module):
         }
         return fine
 
+    def _build_class_prototypes(self, feature_map, anchor_probability):
+        # EXP2_DIAG: deterministic semantic weighting for offline diagnostics only.
+        feature_map = feature_map[0]
+        probability = F.interpolate(anchor_probability, size=feature_map.shape[-2:],
+                                    mode='bilinear', align_corners=False)[0]
+        feature_flat = feature_map.reshape(feature_map.shape[0], -1).transpose(0, 1)
+        prototypes, masses = [], []
+        for class_id in (1, 2, 3):
+            weights = probability[class_id].reshape(-1)
+            mass = weights.sum()
+            prototype = (weights.unsqueeze(1) * feature_flat).sum(0) / (mass + 1e-8)
+            prototypes.append(F.normalize(prototype, dim=0))
+            masses.append(mass)
+        return torch.stack(prototypes), torch.stack(masses)
+
 def configure_model(model):
     """Configure model for use with tent."""
     # train mode, because tent optimizes the model to minimize entropy
@@ -273,6 +310,9 @@ class Prototype_Pool(nn.Module):
         self.image_bank = torch.tensor([]).cuda()
         self.mask_bank = torch.tensor([]).cuda()
         self.name_list = []
+        # EXP2_DIAG: parallel metadata bank; never consumed by model retrieval.
+        self.class_prototype_bank = None
+        self.class_mass_bank = None
         # EXP0_5_DIAG: retrieval metadata only; it is not consumed by the method.
         self.last_retrieval_diag = {'indices': [], 'similarities': []}
     def get_pool_feature(self, x, mask, top_k = 5):
@@ -331,3 +371,17 @@ class Prototype_Pool(nn.Module):
             else:
                 self.name_list = self.name_list[-self.max_length:]
                 self.name_list.append(image)
+
+    def update_diagnostic_prototype_pool(self, prototypes, masses):
+        # EXP2_DIAG: mirror the released FIFO ordering without affecting outputs.
+        prototypes = prototypes.detach().unsqueeze(0)
+        masses = masses.detach().unsqueeze(0)
+        if self.class_prototype_bank is None:
+            self.class_prototype_bank = prototypes
+            self.class_mass_bank = masses
+        elif self.class_prototype_bank.shape[0] < self.max_length:
+            self.class_prototype_bank = torch.cat([self.class_prototype_bank, prototypes], dim=0)
+            self.class_mass_bank = torch.cat([self.class_mass_bank, masses], dim=0)
+        else:
+            self.class_prototype_bank = torch.cat([self.class_prototype_bank[-self.max_length:], prototypes], dim=0)
+            self.class_mass_bank = torch.cat([self.class_mass_bank[-self.max_length:], masses], dim=0)
