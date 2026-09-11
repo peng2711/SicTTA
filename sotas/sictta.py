@@ -39,6 +39,8 @@ class TTA(nn.Module):
         self.last_class_memory_masses = None
         self.last_class_memory_names = []
         self.last_anchor_probability = None
+        # EXP3_DIAG: expose the unchanged pre-SABE/SFF bottleneck map for proxy diagnostics.
+        self.last_latent_feature_map = None
 
     def reset_admission_history(self):
         self.entropy_list = []
@@ -56,6 +58,8 @@ class TTA(nn.Module):
         topk = self.topk
         latent_model = model.get_feature(x, loc = layer_fea)
         latent_feature_map = latent_model
+        # EXP3_DIAG: this is the same feature tensor used by Released global retrieval.
+        self.last_latent_feature_map = latent_feature_map
         b,c,w,h = latent_model.shape
         sup_pixel = w
         latent_model = latent_model.reshape(b,c,int(w/sup_pixel),sup_pixel,int(h/sup_pixel),sup_pixel)
