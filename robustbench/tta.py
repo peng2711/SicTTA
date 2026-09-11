@@ -68,7 +68,8 @@ def setup_sitta(model):
 
 
 def setup_sictta(model, use_test_bn=True, use_sabe=True, use_sff=True,
-                 admission_policy='released', gate_mode='released', gate_gamma=1.0):
+                 admission_policy='released', gate_mode='released', gate_gamma=1.0,
+                 fusion_mode='released'):
     anchor_model = deepcopy(model)
     # EXP0_REPRO: defaults preserve the released full SicTTA setup.
     if use_test_bn:
@@ -82,7 +83,8 @@ def setup_sictta(model, use_test_bn=True, use_sabe=True, use_sff=True,
                               use_sabe=use_sabe,
                               use_sff=use_sff,
                               admission_policy=admission_policy,
-                              gate_mode=gate_mode, gate_gamma=gate_gamma)
+                              gate_mode=gate_mode, gate_gamma=gate_gamma,
+                              fusion_mode=fusion_mode)
     return sictta_model
 
 def setup_optimizer(params):

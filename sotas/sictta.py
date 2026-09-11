@@ -9,7 +9,7 @@ class TTA(nn.Module):
     """
     def __init__(self, model, model_anchor, use_test_bn=True,
                  use_sabe=True, use_sff=True, admission_policy='released',
-                 gate_mode='released', gate_gamma=1.0):
+                 gate_mode='released', gate_gamma=1.0, fusion_mode='released'):
         super().__init__()
         self.model = model
         self.model_anchor = model_anchor.eval()
@@ -26,6 +26,10 @@ class TTA(nn.Module):
             raise ValueError(gate_mode)
         self.gate_mode = gate_mode
         self.gate_gamma = float(gate_gamma)
+        if fusion_mode not in {'released', 'crsff_identity', 'global_reliability',
+                               'class_reliability', 'inverse_class_reliability'}:
+            raise ValueError(fusion_mode)
+        self.fusion_mode = fusion_mode
 
         self.num_classes = 4
         self.max_lens = 40
@@ -50,6 +54,8 @@ class TTA(nn.Module):
         self.last_gate_diag = {}
         self.last_released_sff_feature = None
         self.last_gated_sff_feature = None
+        # EXP6_CRSFF: read-only diagnostic state for the fusion-weight experiment.
+        self.last_crsff_diag = {}
 
     def reset_admission_history(self):
         self.entropy_list = []
@@ -71,6 +77,7 @@ class TTA(nn.Module):
         self.last_latent_feature_map = latent_feature_map
         self.last_released_sff_feature = None
         self.last_gated_sff_feature = None
+        self.last_crsff_diag = {}
         b,c,w,h = latent_model.shape
         sup_pixel = w
         latent_model = latent_model.reshape(b,c,int(w/sup_pixel),sup_pixel,int(h/sup_pixel),sup_pixel)
@@ -118,6 +125,18 @@ class TTA(nn.Module):
         self.last_class_prototypes, self.last_class_masses = self._build_class_prototypes(
             latent_feature_map, self.last_anchor_probability)
 
+        # EXP6_CRSFF: only the Top-K internal memory weights may change.
+        if self.use_sff and self.fusion_mode != 'released' and out_image is not None:
+            latent_model_ = self._apply_crsff_fusion(
+                latent_model, latent_model_, fff, latent_feature_map,
+                self.last_anchor_probability, self.pool.last_fusion_diag,
+                c, w, h, self.fusion_mode)
+        elif self.use_sff and out_image is not None:
+            self.last_crsff_diag = self._build_crsff_diag(
+                self.pool.last_fusion_diag, self.pool.last_retrieval_diag,
+                self.pool.class_reliability_bank, self.pool.class_soft_mass_bank,
+                self.pool.name_list, self.last_anchor_probability, self.fusion_mode)
+
         # EXP4_GATE: keep Released and Identity on the exact original feature path.
         self.last_gate_diag = self._empty_gate_diag()
         self.last_gate_diag['global_rate'] = self.pool.last_fusion_diag.get('global_rate', 0.0)
@@ -129,6 +148,9 @@ class TTA(nn.Module):
             self.pool.update_name_pool(names[0])
             self.pool.update_diagnostic_prototype_pool(self.last_class_prototypes,
                                                        self.last_class_masses)
+            reliability, soft_mass = self._anchor_class_reliability(self.last_anchor_probability)
+            self.pool.update_reliability_pool(reliability, soft_mass)
+        self.pool.validate_synchronized_banks()
         if out_image is not None:
             if self.use_sabe:
                 out_image = out_image[0]
@@ -197,6 +219,7 @@ class TTA(nn.Module):
             'diagnostic_pool_size_before': len(self.last_class_memory_names),
             'diagnostic_pool_size_after': len(self.pool.name_list),
             'gate': dict(self.last_gate_diag),
+            'crsff': dict(self.last_crsff_diag),
         }
         return output
 
@@ -316,6 +339,147 @@ class TTA(nn.Module):
             'corr_released_myo': float('nan'), 'corr_released_rv': float('nan'),
             'corr_gated_lv': float('nan'), 'corr_gated_myo': float('nan'), 'corr_gated_rv': float('nan'),
         }
+
+    def _anchor_class_reliability(self, probability):
+        # EXP6_CRSFF: exact EXP-3 Class Confidence and foreground soft mass.
+        probability = probability[0].detach().float()
+        foreground = probability[1:]
+        soft_mass = foreground.sum(dim=(1, 2))
+        reliability = foreground.square().sum(dim=(1, 2)) / (soft_mass + 1e-8)
+        return reliability, soft_mass
+
+    def _build_crsff_diag(self, fusion_diag, retrieval_diag, reliability_bank,
+                          mass_bank, names, anchor_probability, fusion_mode):
+        # EXP6_CRSFF: report exact Top-K weights and class-conditioned changes.
+        indices = list(fusion_diag.get('topk_indices', []))
+        similarities = torch.as_tensor(fusion_diag.get('topk_similarities', []),
+                                       device=self.pool.feature_bank.device, dtype=torch.float32)
+        if not indices or similarities.numel() == 0 or reliability_bank is None or reliability_bank.shape[0] == 0:
+            return {'fusion_mode': fusion_mode, 'pool_size': int(self.pool.feature_bank.shape[0]),
+                    'global_rate': float(fusion_diag.get('global_rate', 0.0)), 'topk_indices': indices,
+                    'topk_names': [names[i] for i in indices if i < len(names)],
+                    'topk_similarities': similarities.detach().cpu().tolist(),
+                    'query_class_soft_mass': [], 'released_weights': [], 'memory_class_reliabilities': [],
+                    'global_reliability_weights': [], 'class_reliability_weights': [],
+                    'inverse_class_reliability_weights': [], 'weight_l1_change_vs_released': [],
+                    'weight_entropy_released': 0.0, 'weight_entropy_class': [],
+                    'top1_weight_released': 0.0, 'top1_weight_class': []}
+        index_tensor = torch.as_tensor(indices, device=reliability_bank.device, dtype=torch.long)
+        rel = reliability_bank[index_tensor].detach().float()
+        masses = mass_bank[index_tensor].detach().float()
+        released = torch.softmax(similarities, dim=0)
+        raw_global_rel = (rel * masses).sum(dim=1) / (masses.sum(dim=1) + 1e-8)
+        effective_rel = rel
+        exp_sim = torch.exp(similarities)
+        if fusion_mode in {'released', 'crsff_identity'}:
+            if fusion_mode == 'crsff_identity':
+                effective_rel = torch.ones_like(rel)
+            global_rel = torch.ones_like(raw_global_rel) if fusion_mode == 'crsff_identity' else raw_global_rel
+            global_weights = released
+            class_weights = released[:, None].expand(-1, 3)
+        elif fusion_mode == 'global_reliability':
+            global_rel = raw_global_rel
+            effective_rel = raw_global_rel[:, None].expand(-1, 3)
+            global_weights = exp_sim * global_rel
+            global_weights = global_weights / (global_weights.sum() + 1e-8)
+            class_weights = global_weights[:, None].expand(-1, 3)
+        elif fusion_mode == 'class_reliability':
+            global_rel = raw_global_rel
+            class_weights = exp_sim[:, None] * rel
+            class_weights = class_weights / (class_weights.sum(dim=0, keepdim=True) + 1e-8)
+            global_weights = released
+        elif fusion_mode == 'inverse_class_reliability':
+            global_rel = raw_global_rel
+            effective_rel = torch.clamp(1.0 - rel, min=1e-6)
+            class_weights = exp_sim[:, None] * effective_rel
+            class_weights = class_weights / (class_weights.sum(dim=0, keepdim=True) + 1e-8)
+            global_weights = released
+        else:
+            raise ValueError(fusion_mode)
+        inverse_rel = torch.clamp(1.0 - rel, min=1e-6)
+        inverse_weights = exp_sim[:, None] * inverse_rel
+        inverse_weights = inverse_weights / (inverse_weights.sum(dim=0, keepdim=True) + 1e-8)
+        query_mass = self._anchor_class_reliability(anchor_probability)[1]
+        def entropy(values):
+            return -(values * torch.log(values + 1e-8)).sum(dim=0)
+        class_l1 = (class_weights - released[:, None]).abs().sum(dim=0)
+        selected_names = [names[i] if i < len(names) else None for i in indices]
+        return {
+            'fusion_mode': fusion_mode, 'pool_size': int(self.pool.feature_bank.shape[0]),
+            'global_rate': float(fusion_diag.get('global_rate', 0.0)), 'topk_indices': indices,
+            'topk_names': selected_names, 'topk_similarities': similarities.detach().cpu().tolist(),
+            'query_class_soft_mass': query_mass.detach().cpu().tolist(),
+            'released_weights': released.detach().cpu().tolist(),
+            'memory_class_reliabilities': rel.detach().cpu().tolist(),
+            'effective_class_reliabilities': effective_rel.detach().cpu().tolist(),
+            'memory_class_soft_masses': masses.detach().cpu().tolist(),
+            'memory_global_reliabilities': raw_global_rel.detach().cpu().tolist(),
+            'global_reliability_weights': global_weights.detach().cpu().tolist(),
+            'class_reliability_weights': class_weights.detach().cpu().T.tolist(),
+            'inverse_class_reliability_weights': inverse_weights.detach().cpu().T.tolist(),
+            'weight_l1_change_vs_released': class_l1.detach().cpu().tolist(),
+            'weight_entropy_released': float(entropy(released).item()),
+            'weight_entropy_class': entropy(class_weights).detach().cpu().tolist(),
+            'top1_weight_released': float(released.max().item()),
+            'top1_weight_class': class_weights.max(dim=0).values.detach().cpu().tolist(),
+            'bank_lengths': {'feature': int(self.pool.feature_bank.shape[0]),
+                             'image': int(self.pool.image_bank.shape[0]),
+                             'mask': int(self.pool.mask_bank.shape[0]),
+                             'name': len(self.pool.name_list),
+                             'reliability': int(reliability_bank.shape[0]),
+                             'soft_mass': int(mass_bank.shape[0])},
+        }
+
+    def _apply_crsff_fusion(self, current_flat, released_flat, retrieved_flat,
+                            current_feature, anchor_probability, fusion_diag,
+                            c, w, h, fusion_mode):
+        # EXP6_CRSFF: fixed Top-K, class reliability reweighting, soft query assignment.
+        diag = self._build_crsff_diag(
+            fusion_diag, self.pool.last_retrieval_diag,
+            self.pool.class_reliability_bank, self.pool.class_soft_mass_bank,
+            self.pool.name_list, anchor_probability, fusion_mode)
+        self.last_crsff_diag = diag
+        indices = list(fusion_diag.get('topk_indices', []))
+        if not indices or retrieved_flat is None or self.pool.class_reliability_bank.shape[0] == 0:
+            return released_flat
+        similarities = torch.as_tensor(fusion_diag['topk_similarities'], device=current_flat.device, dtype=current_flat.dtype)
+        index_tensor = torch.as_tensor(indices, device=current_flat.device, dtype=torch.long)
+        rel = self.pool.class_reliability_bank[index_tensor].to(current_flat.dtype)
+        masses = self.pool.class_soft_mass_bank[index_tensor].to(current_flat.dtype)
+        exp_sim = torch.exp(similarities)
+        released_weights = torch.softmax(similarities, dim=0)
+        global_rel = (rel * masses).sum(dim=1) / (masses.sum(dim=1) + 1e-8)
+        if fusion_mode == 'crsff_identity':
+            global_weights = released_weights
+            class_weights = released_weights[:, None].expand(-1, 3)
+        elif fusion_mode == 'global_reliability':
+            global_weights = exp_sim * global_rel
+            global_weights = global_weights / (global_weights.sum() + 1e-8)
+            class_weights = global_weights[:, None].expand(-1, 3)
+        elif fusion_mode == 'class_reliability':
+            class_weights = exp_sim[:, None] * rel
+            class_weights = class_weights / (class_weights.sum(dim=0, keepdim=True) + 1e-8)
+            global_weights = released_weights
+        elif fusion_mode == 'inverse_class_reliability':
+            rel_for_class = torch.clamp(1.0 - rel, min=1e-6)
+            class_weights = exp_sim[:, None] * rel_for_class
+            class_weights = class_weights / (class_weights.sum(dim=0, keepdim=True) + 1e-8)
+            global_weights = released_weights
+        else:
+            raise ValueError(fusion_mode)
+        if fusion_mode == 'crsff_identity':
+            # Directly preserve the released tensor for the regression-test hash.
+            return released_flat
+        memory = retrieved_flat[0].view(len(indices), c, w, h)
+        current = current_feature[0].to(memory.dtype)
+        mem_bg = torch.einsum('k,kchw->chw', global_weights, memory)
+        mem_classes = torch.stack([torch.einsum('k,kchw->chw', class_weights[:, i], memory) for i in range(3)])
+        probability = F.interpolate(anchor_probability[0].detach().float().unsqueeze(0),
+                                    size=(w, h), mode='bilinear', align_corners=False)[0].to(memory.dtype)
+        memory_mix = probability[0] * mem_bg + torch.einsum('ihw,ichw->chw', probability[1:], mem_classes)
+        rate = float(fusion_diag.get('global_rate', 0.0))
+        fused = (1.0 - rate) * current + rate * memory_mix
+        return fused.unsqueeze(0).reshape(1, -1)
 
     def _diagnose_gate(self, current, released, anchor_probability, global_rate,
                        alpha_foreground, gated, fallback):
@@ -442,6 +606,9 @@ class Prototype_Pool(nn.Module):
         self.class_mass_bank = None
         # EXP4_GATE: expose the exact Released global SFF rate without changing fusion.
         self.last_fusion_diag = {'global_rate': 0.0, 'topk_count': 0}
+        # EXP6_CRSFF: metadata banks mirror the actual released pool behavior.
+        self.class_reliability_bank = torch.empty((0, 3)).cuda()
+        self.class_soft_mass_bank = torch.empty((0, 3)).cuda()
         # EXP0_5_DIAG: retrieval metadata only; it is not consumed by the method.
         self.last_retrieval_diag = {'indices': [], 'similarities': []}
     def get_pool_feature(self, x, mask, top_k = 5):
@@ -461,6 +628,8 @@ class Prototype_Pool(nn.Module):
             self.last_fusion_diag = {
                 'global_rate': float(rates.detach().cpu().item()),
                 'topk_count': int(outall.shape[1]),
+                'topk_indices': outall[0].detach().cpu().tolist(),
+                'topk_similarities': cosine_similarities[0][outall[0]].detach().cpu().tolist(),
             }
             weight = rates * torch.exp(cosine_similarities[0][outall[0]]) / torch.sum(torch.exp(cosine_similarities[0][outall[0]]))
             x = x * (1-rates)
@@ -470,7 +639,8 @@ class Prototype_Pool(nn.Module):
         else:
             # EXP0_5_DIAG: an empty pool has no retrieval ranks.
             self.last_retrieval_diag = {'indices': [], 'similarities': []}
-            self.last_fusion_diag = {'global_rate': 0.0, 'topk_count': 0}
+            self.last_fusion_diag = {'global_rate': 0.0, 'topk_count': 0,
+                                     'topk_indices': [], 'topk_similarities': []}
             return x,x,None,None, len(self.feature_bank)
 
     def update_feature_pool(self, feature):
@@ -520,3 +690,21 @@ class Prototype_Pool(nn.Module):
         else:
             self.class_prototype_bank = torch.cat([self.class_prototype_bank[-self.max_length:], prototypes], dim=0)
             self.class_mass_bank = torch.cat([self.class_mass_bank[-self.max_length:], masses], dim=0)
+
+    def update_reliability_pool(self, reliability, soft_mass):
+        # EXP6_CRSFF: append reliability metadata with the same max=40/actual-41 FIFO behavior.
+        reliability = reliability.detach().reshape(1, 3)
+        soft_mass = soft_mass.detach().reshape(1, 3)
+        if self.class_reliability_bank.shape[0] < self.max_length:
+            self.class_reliability_bank = torch.cat([self.class_reliability_bank, reliability], dim=0)
+            self.class_soft_mass_bank = torch.cat([self.class_soft_mass_bank, soft_mass], dim=0)
+        else:
+            self.class_reliability_bank = torch.cat([self.class_reliability_bank[-self.max_length:], reliability], dim=0)
+            self.class_soft_mass_bank = torch.cat([self.class_soft_mass_bank[-self.max_length:], soft_mass], dim=0)
+
+    def validate_synchronized_banks(self):
+        # EXP6_CRSFF: stop immediately if metadata and released memory banks diverge.
+        lengths = [self.feature_bank.shape[0], self.image_bank.shape[0], self.mask_bank.shape[0],
+                   len(self.name_list), self.class_reliability_bank.shape[0], self.class_soft_mass_bank.shape[0]]
+        if len(set(int(length) for length in lengths)) != 1:
+            raise RuntimeError(f'EXP6_CRSFF bank desynchronization: {lengths}')
