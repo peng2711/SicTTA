@@ -67,7 +67,8 @@ def setup_sitta(model):
     return cotta_model
 
 
-def setup_sictta(model, use_test_bn=True, use_sabe=True, use_sff=True):
+def setup_sictta(model, use_test_bn=True, use_sabe=True, use_sff=True,
+                 admission_policy='released'):
     anchor_model = deepcopy(model)
     # EXP0_REPRO: defaults preserve the released full SicTTA setup.
     if use_test_bn:
@@ -79,7 +80,8 @@ def setup_sictta(model, use_test_bn=True, use_sabe=True, use_sff=True):
     sictta_model = sictta.TTA(model, anchor_model,
                               use_test_bn=use_test_bn,
                               use_sabe=use_sabe,
-                              use_sff=use_sff)
+                              use_sff=use_sff,
+                              admission_policy=admission_policy)
     return sictta_model
 
 def setup_optimizer(params):

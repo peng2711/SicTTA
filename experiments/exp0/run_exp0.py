@@ -116,7 +116,8 @@ def json_safe(value):
     return value
 
 
-def load_model(mode: str, checkpoint: Path, device: torch.device):
+def load_model(mode: str, checkpoint: Path, device: torch.device,
+               admission_policy: str = "released"):
     sys.path.insert(0, str(ROOT))
     from robustbench.seg_net.unet import UNet
     from robustbench.tta import setup_sictta
@@ -137,11 +138,14 @@ def load_model(mode: str, checkpoint: Path, device: torch.device):
         return norm.Norm(base).to(device)
     if mode == "sff":
         # EXP0_REPRO: SFF uses source BN and no enhanced batch.
-        return setup_sictta(base, use_test_bn=False, use_sabe=False, use_sff=True)
+        return setup_sictta(base, use_test_bn=False, use_sabe=False, use_sff=True,
+                            admission_policy=admission_policy)
     if mode == "sabe":
-        return setup_sictta(base, use_test_bn=True, use_sabe=True, use_sff=False)
+        return setup_sictta(base, use_test_bn=True, use_sabe=True, use_sff=False,
+                            admission_policy=admission_policy)
     if mode == "full":
-        return setup_sictta(base, use_test_bn=True, use_sabe=True, use_sff=True)
+        return setup_sictta(base, use_test_bn=True, use_sabe=True, use_sff=True,
+                            admission_policy=admission_policy)
     raise ValueError(mode)
 
 

@@ -8,7 +8,7 @@ class TTA(nn.Module):
     Once tented, a model adapts itself by updating on every forward.
     """
     def __init__(self, model, model_anchor, use_test_bn=True,
-                 use_sabe=True, use_sff=True):
+                 use_sabe=True, use_sff=True, admission_policy='released'):
         super().__init__()
         self.model = model
         self.model_anchor = model_anchor.eval()
@@ -17,6 +17,10 @@ class TTA(nn.Module):
         self.use_test_bn = use_test_bn
         self.use_sabe = use_sabe
         self.use_sff = use_sff
+        if admission_policy not in {'released', 'rolling_all_40', 'rolling_all_160',
+                                    'sft_queue_40', 'domain_reset_oracle'}:
+            raise ValueError(admission_policy)
+        self.admission_policy = admission_policy
 
         self.num_classes = 4
         self.max_lens = 40
@@ -27,6 +31,10 @@ class TTA(nn.Module):
         # EXP0_5_DIAG: read-only state populated from existing intermediates.
         self.last_diag = {}
         self.last_ccd_diag = {}
+        self.accepted_ccd_queue = []
+
+    def reset_admission_history(self):
+        self.entropy_list = []
     def forward(self, x, names):
         for _ in range(1):
             outputs = self.forward_and_adapt(x, self.model, names)
@@ -110,6 +118,11 @@ class TTA(nn.Module):
             'name': len(self.pool.name_list),
         }
         ccd_diag = dict(self.last_ccd_diag)
+        if self.admission_policy in {'released', 'domain_reset_oracle'}:
+            effective_history_before = min(history_before, self.max_lens)
+        else:
+            effective_history_before = history_before
+        effective_history_after = ccd_diag.get('history_len_after', len(self.entropy_list))
         self.last_diag = {
             'ccd': ccd_diag.get('ccd'),
             'ccd_threshold': ccd_diag.get('ccd_threshold'),
@@ -118,6 +131,10 @@ class TTA(nn.Module):
             'is_sft': bool(ccd_diag.get('fine', False)),
             'ccd_history_len_before': history_before,
             'ccd_history_len_after': len(self.entropy_list),
+            'admission_history_len': effective_history_after,
+            'admission_history_len_before': effective_history_before,
+            'admission_history_len_after': effective_history_after,
+            'admission_history_type': ccd_diag.get('admission_history_type', 'released_local_trimmed_threshold_history'),
             'pool_before': pool_before,
             'pool_after': pool_after,
             # EXP0_5_DIAG: distinguish an actual FIFO write from pool growth.
@@ -139,6 +156,8 @@ class TTA(nn.Module):
             return en
 
     def get_fine_ccd(self, x, model_anchor,entropy_list, threshold = 0.9):
+        if self.admission_policy in {'rolling_all_40', 'rolling_all_160', 'sft_queue_40'}:
+            return self._get_fine_ccd_controlled(x, model_anchor, threshold)
         with torch.no_grad():
             b,c,w,h = x.shape
             for i in range(b):
@@ -176,6 +195,56 @@ class TTA(nn.Module):
                 'history_len_after': len(entropy_list),
             }
             return False
+
+    def _get_fine_ccd_controlled(self, x, model_anchor, threshold):
+        values = []
+        with torch.no_grad():
+            b,c,w,h = x.shape
+            for i in range(b):
+                pred1 = model_anchor(x[i:i+1]).softmax(1).detach()
+                pred1 = pred1.permute(0,2,3,1)
+                pred1 = pred1.reshape(-1, pred1.size(3))
+                pred1_rand = torch.randperm(pred1.size(0))
+                select_point = 200
+                pred1 = F.normalize(pred1[pred1_rand[:select_point]])
+                values.append(self.entropy(torch.matmul(pred1.t(), pred1)))
+
+        current = values[-1]
+        if self.admission_policy in {'rolling_all_40', 'rolling_all_160'}:
+            window = 40 if self.admission_policy == 'rolling_all_40' else 160
+            candidate_history = (list(self.entropy_list) + values)[-window:]
+            self.entropy_list[:] = candidate_history
+            self.accepted_ccd_queue = []
+            history_type = f'rolling_all_{window}'
+        else:
+            candidate_history = list(self.accepted_ccd_queue) + values
+            history_type = 'sft_queue_40'
+
+        sorted_list = sorted(candidate_history)
+        ten_percent_index = int(len(sorted_list) * (1 - threshold))
+        if ten_percent_index > 0:
+            ten_percent_min_value = sorted_list[:ten_percent_index][-1]
+            fine = bool(current <= ten_percent_min_value)
+            cutoff = (float(ten_percent_min_value.detach().cpu().item())
+                      if torch.is_tensor(ten_percent_min_value) else float(ten_percent_min_value))
+        else:
+            fine = False
+            cutoff = None
+
+        if self.admission_policy == 'sft_queue_40':
+            if fine:
+                self.accepted_ccd_queue = (self.accepted_ccd_queue + values)[-40:]
+            self.entropy_list[:] = self.accepted_ccd_queue
+
+        self.last_ccd_diag = {
+            'ccd': float(current.detach().cpu().item()),
+            'ccd_threshold': cutoff,
+            'fine': fine,
+            'history_len_after': len(self.entropy_list),
+            'admission_history_len': len(candidate_history),
+            'admission_history_type': history_type,
+        }
+        return fine
 
 def configure_model(model):
     """Configure model for use with tent."""
