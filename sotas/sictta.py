@@ -64,6 +64,9 @@ class TTA(nn.Module):
         self.last_localcorr_retrieved_features = None
         self.last_localcorr_retrieved_names = []
         self.last_localcorr_retrieved_similarities = []
+        # EXP8_SABE_BN_DIAG: a read-only phase tag consumed by external BN
+        # pre-hooks.  It never participates in the released computation.
+        self.exp8_bn_phase = None
 
     def reset_admission_history(self):
         self.entropy_list = []
@@ -79,6 +82,8 @@ class TTA(nn.Module):
         self.ww = x.shape[-1]
         bad_num = x.shape[0]
         topk = self.topk
+        # EXP8_SABE_BN_DIAG: identify the existing initial query encoder call.
+        self.exp8_bn_phase = 'query_encoder_initial'
         latent_model = model.get_feature(x, loc = layer_fea)
         latent_feature_map = latent_model
         # EXP3_DIAG: this is the same feature tensor used by Released global retrieval.
@@ -173,6 +178,9 @@ class TTA(nn.Module):
         if fine:
             self.pool.update_feature_pool(latent_model)
             self.pool.update_image_pool(x)
+            # EXP8_SABE_BN_DIAG: this is an existing mask-bank forward and is
+            # excluded from the primary SABE BN analysis.
+            self.exp8_bn_phase = 'sft_mask_update'
             self.pool.update_mask_pool(model(x).softmax(1))
             self.pool.update_name_pool(names[0])
             self.pool.update_diagnostic_prototype_pool(self.last_class_prototypes,
@@ -185,6 +193,9 @@ class TTA(nn.Module):
             if self.use_sabe:
                 out_image = out_image[0]
                 x_hised = torch.cat((x, out_image), dim=0)
+                # EXP8_SABE_BN_DIAG: identify the existing enhanced-batch
+                # encoder call; no tensor or model behavior is changed.
+                self.exp8_bn_phase = 'sabe_encoder'
                 latent_model = model.get_feature(x_hised, loc = layer_fea)
             else:
                 # EXP0_REPRO: source-BN SFF does not construct an enhanced
@@ -209,6 +220,9 @@ class TTA(nn.Module):
             if self.use_sff:
                 latent_model[0:1] = latent_model_
                 self.last_gated_sff_feature = latent_model_.detach()
+            # EXP8_SABE_BN_DIAG: identify the existing enhanced-batch decoder
+            # call; the hook only reads its BN inputs.
+            self.exp8_bn_phase = 'sabe_decoder'
             output = model.get_output(latent_model,loc = layer_fea)[0:1].softmax(1)
         else:
             output = self.model_anchor(x)
