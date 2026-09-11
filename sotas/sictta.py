@@ -8,7 +8,8 @@ class TTA(nn.Module):
     Once tented, a model adapts itself by updating on every forward.
     """
     def __init__(self, model, model_anchor, use_test_bn=True,
-                 use_sabe=True, use_sff=True, admission_policy='released'):
+                 use_sabe=True, use_sff=True, admission_policy='released',
+                 gate_mode='released', gate_gamma=1.0):
         super().__init__()
         self.model = model
         self.model_anchor = model_anchor.eval()
@@ -21,6 +22,10 @@ class TTA(nn.Module):
                                     'sft_queue_40', 'domain_reset_oracle'}:
             raise ValueError(admission_policy)
         self.admission_policy = admission_policy
+        if gate_mode not in {'released', 'identity', 'lowconf', 'highconf'}:
+            raise ValueError(gate_mode)
+        self.gate_mode = gate_mode
+        self.gate_gamma = float(gate_gamma)
 
         self.num_classes = 4
         self.max_lens = 40
@@ -41,6 +46,10 @@ class TTA(nn.Module):
         self.last_anchor_probability = None
         # EXP3_DIAG: expose the unchanged pre-SABE/SFF bottleneck map for proxy diagnostics.
         self.last_latent_feature_map = None
+        # EXP4_GATE: diagnostics for the optional SFF strength modulation.
+        self.last_gate_diag = {}
+        self.last_released_sff_feature = None
+        self.last_gated_sff_feature = None
 
     def reset_admission_history(self):
         self.entropy_list = []
@@ -60,6 +69,8 @@ class TTA(nn.Module):
         latent_feature_map = latent_model
         # EXP3_DIAG: this is the same feature tensor used by Released global retrieval.
         self.last_latent_feature_map = latent_feature_map
+        self.last_released_sff_feature = None
+        self.last_gated_sff_feature = None
         b,c,w,h = latent_model.shape
         sup_pixel = w
         latent_model = latent_model.reshape(b,c,int(w/sup_pixel),sup_pixel,int(h/sup_pixel),sup_pixel)
@@ -107,6 +118,10 @@ class TTA(nn.Module):
         self.last_class_prototypes, self.last_class_masses = self._build_class_prototypes(
             latent_feature_map, self.last_anchor_probability)
 
+        # EXP4_GATE: keep Released and Identity on the exact original feature path.
+        self.last_gate_diag = self._empty_gate_diag()
+        self.last_gate_diag['global_rate'] = self.pool.last_fusion_diag.get('global_rate', 0.0)
+
         if fine:
             self.pool.update_feature_pool(latent_model)
             self.pool.update_image_pool(x)
@@ -126,8 +141,22 @@ class TTA(nn.Module):
             latent_model_ = latent_model_.view(bad_num,int(w/sup_pixel),int(h/sup_pixel),c,sup_pixel,sup_pixel)
             latent_model_ = latent_model_.permute(0,3,1,4,2,5)
             latent_model_ = latent_model_.reshape(bad_num,c,w,h)
+            # EXP4_GATE: retain exact feature tensors used by Released and gated SFF.
+            self.last_released_sff_feature = latent_model_.detach()
+            if self.use_sff and self.gate_mode != 'released':
+                latent_model_, self.last_gate_diag = self._apply_exp4_gate(
+                    latent_feature_map, latent_model_, self.last_anchor_probability,
+                    self.pool.last_fusion_diag.get('global_rate', 0.0), self.gate_mode,
+                    self.gate_gamma)
+            elif self.use_sff:
+                self.last_gate_diag = self._diagnose_gate(
+                    latent_feature_map, latent_model_, self.last_anchor_probability,
+                    self.pool.last_fusion_diag.get('global_rate', 0.0),
+                    torch.full((3,), self.pool.last_fusion_diag.get('global_rate', 0.0),
+                               device=latent_model_.device), latent_model_, False)
             if self.use_sff:
                 latent_model[0:1] = latent_model_
+                self.last_gated_sff_feature = latent_model_.detach()
             output = model.get_output(latent_model,loc = layer_fea)[0:1].softmax(1)
         else:
             output = self.model_anchor(x)
@@ -167,6 +196,7 @@ class TTA(nn.Module):
             'retrieved_names': retrieval_names,
             'diagnostic_pool_size_before': len(self.last_class_memory_names),
             'diagnostic_pool_size_after': len(self.pool.name_list),
+            'gate': dict(self.last_gate_diag),
         }
         return output
 
@@ -272,6 +302,99 @@ class TTA(nn.Module):
         }
         return fine
 
+    def _empty_gate_diag(self):
+        # EXP4_GATE: keep a stable schema for empty-pool and non-SFF cases.
+        return {
+            'global_rate': 0.0, 'r_lv': float('nan'), 'r_myo': float('nan'), 'r_rv': float('nan'),
+            'r_bar': float('nan'), 'alpha_lv': float('nan'), 'alpha_myo': float('nan'),
+            'alpha_rv': float('nan'), 'alpha_map_mean': float('nan'), 'alpha_map_std': float('nan'),
+            'alpha_map_min': float('nan'), 'alpha_map_max': float('nan'),
+            'fraction_alpha_clipped_0': float('nan'), 'fraction_alpha_clipped_1': float('nan'),
+            'scale_map_mean': float('nan'), 'scale_map_max': float('nan'), 'a_fallback': False,
+            'correction_norm_released': float('nan'), 'correction_norm_gated': float('nan'),
+            'correction_norm_ratio': float('nan'), 'corr_released_lv': float('nan'),
+            'corr_released_myo': float('nan'), 'corr_released_rv': float('nan'),
+            'corr_gated_lv': float('nan'), 'corr_gated_myo': float('nan'), 'corr_gated_rv': float('nan'),
+        }
+
+    def _diagnose_gate(self, current, released, anchor_probability, global_rate,
+                       alpha_foreground, gated, fallback):
+        # EXP4_GATE: diagnostics are computed from the exact current/released SFF tensors.
+        probability = anchor_probability[0].detach()
+        probability_feature = F.interpolate(
+            probability.unsqueeze(0), size=current.shape[-2:], mode='bilinear', align_corners=False)[0]
+        alpha_values = torch.cat((torch.as_tensor([global_rate], device=current.device), alpha_foreground))
+        alpha_map = (probability_feature * alpha_values.view(-1, 1, 1)).sum(dim=0)
+        released_delta = released - current
+        gated_delta = gated - current
+        released_norm = torch.linalg.vector_norm(released_delta).item()
+        gated_norm = torch.linalg.vector_norm(gated_delta).item()
+        diag = self._empty_gate_diag()
+        diag.update({
+            'global_rate': float(global_rate),
+            'r_lv': float('nan'), 'r_myo': float('nan'), 'r_rv': float('nan'),
+            'alpha_lv': float(alpha_foreground[0].detach().cpu().item()),
+            'alpha_myo': float(alpha_foreground[1].detach().cpu().item()),
+            'alpha_rv': float(alpha_foreground[2].detach().cpu().item()),
+            'alpha_map_mean': float(alpha_map.mean().item()), 'alpha_map_std': float(alpha_map.std(unbiased=False).item()),
+            'alpha_map_min': float(alpha_map.min().item()), 'alpha_map_max': float(alpha_map.max().item()),
+            'fraction_alpha_clipped_0': float((alpha_map <= 1e-12).float().mean().item()),
+            'fraction_alpha_clipped_1': float((alpha_map >= 1 - 1e-12).float().mean().item()),
+            'a_fallback': bool(fallback), 'correction_norm_released': float(released_norm),
+            'correction_norm_gated': float(gated_norm),
+            'correction_norm_ratio': float(gated_norm / (released_norm + 1e-8)),
+        })
+        for offset, suffix in enumerate(('lv', 'myo', 'rv'), start=1):
+            weights = probability_feature[offset]
+            denominator = weights.sum() + 1e-8
+            released_class = (weights * torch.linalg.vector_norm(released_delta[0], dim=0)).sum() / denominator
+            gated_class = (weights * torch.linalg.vector_norm(gated_delta[0], dim=0)).sum() / denominator
+            diag[f'corr_released_{suffix}'] = float(released_class.item())
+            diag[f'corr_gated_{suffix}'] = float(gated_class.item())
+        if not fallback:
+            scale_map = alpha_map / (float(global_rate) + 1e-8)
+            diag['scale_map_mean'] = float(scale_map.mean().item())
+            diag['scale_map_max'] = float(scale_map.max().item())
+        return diag
+
+    def _apply_exp4_gate(self, current, released, anchor_probability, global_rate,
+                         gate_mode, gamma):
+        # EXP4_GATE: centered soft class modulation is the only changed adaptation operation.
+        probability = anchor_probability[0].detach()
+        masses = probability[1:].sum(dim=(1, 2))
+        reliability = probability[1:].square().sum(dim=(1, 2)) / (masses + 1e-8)
+        reliability_bar = (masses * reliability).sum() / (masses.sum() + 1e-8)
+        global_tensor = torch.as_tensor(float(global_rate), device=current.device)
+        if gate_mode == 'identity':
+            alpha_foreground = torch.full((3,), global_tensor.item(), device=current.device)
+        elif gate_mode == 'lowconf':
+            alpha_foreground = torch.clamp(
+                global_tensor + gamma * (reliability_bar - reliability), min=0.0, max=1.0)
+        else:
+            alpha_foreground = torch.clamp(
+                global_tensor - gamma * (reliability_bar - reliability), min=0.0, max=1.0)
+        if gate_mode == 'identity':
+            gated = released
+            fallback = False
+        elif float(global_rate) <= 1e-6:
+            gated = released
+            fallback = True
+        else:
+            probability_feature = F.interpolate(
+                probability.unsqueeze(0), size=current.shape[-2:], mode='bilinear', align_corners=False)[0]
+            alpha_values = torch.cat((global_tensor.view(1), alpha_foreground))
+            alpha_map = (probability_feature * alpha_values.view(-1, 1, 1)).sum(dim=0)
+            scale_map = alpha_map / (global_tensor + 1e-8)
+            gated = current + scale_map.unsqueeze(0).unsqueeze(0) * (released - current)
+            fallback = False
+        diag = self._diagnose_gate(current, released, anchor_probability, global_rate,
+                                   alpha_foreground, gated, fallback)
+        diag['r_lv'] = float(reliability[0].item())
+        diag['r_myo'] = float(reliability[1].item())
+        diag['r_rv'] = float(reliability[2].item())
+        diag['r_bar'] = float(reliability_bar.item())
+        return gated, diag
+
     def _build_class_prototypes(self, feature_map, anchor_probability):
         # EXP2_DIAG: deterministic semantic weighting for offline diagnostics only.
         feature_map = feature_map[0]
@@ -317,6 +440,8 @@ class Prototype_Pool(nn.Module):
         # EXP2_DIAG: parallel metadata bank; never consumed by model retrieval.
         self.class_prototype_bank = None
         self.class_mass_bank = None
+        # EXP4_GATE: expose the exact Released global SFF rate without changing fusion.
+        self.last_fusion_diag = {'global_rate': 0.0, 'topk_count': 0}
         # EXP0_5_DIAG: retrieval metadata only; it is not consumed by the method.
         self.last_retrieval_diag = {'indices': [], 'similarities': []}
     def get_pool_feature(self, x, mask, top_k = 5):
@@ -332,6 +457,11 @@ class Prototype_Pool(nn.Module):
                 'similarities': cosine_similarities[0][outall[0]].detach().cpu().tolist(),
             }
             rates = cosine_similarities[0][outall[0]].mean(0)
+            # EXP4_GATE: this is the same scalar used by the Released fusion equation below.
+            self.last_fusion_diag = {
+                'global_rate': float(rates.detach().cpu().item()),
+                'topk_count': int(outall.shape[1]),
+            }
             weight = rates * torch.exp(cosine_similarities[0][outall[0]]) / torch.sum(torch.exp(cosine_similarities[0][outall[0]]))
             x = x * (1-rates)
             for i in range(min(top_k,self.feature_bank.shape[0])):
@@ -340,6 +470,7 @@ class Prototype_Pool(nn.Module):
         else:
             # EXP0_5_DIAG: an empty pool has no retrieval ranks.
             self.last_retrieval_diag = {'indices': [], 'similarities': []}
+            self.last_fusion_diag = {'global_rate': 0.0, 'topk_count': 0}
             return x,x,None,None, len(self.feature_bank)
 
     def update_feature_pool(self, feature):
