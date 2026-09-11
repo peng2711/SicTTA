@@ -59,6 +59,11 @@ class TTA(nn.Module):
         # EXP6_5_SPATIAL_DIAG: pre-update snapshot for offline geometry only.
         self.last_spatial_anchor_probability_bank = None
         self.last_spatial_memory_names = []
+        # EXP7_LOCALCORR_DIAG: retrieval-time feature snapshots for offline matching.
+        self.last_localcorr_query_feature = None
+        self.last_localcorr_retrieved_features = None
+        self.last_localcorr_retrieved_names = []
+        self.last_localcorr_retrieved_similarities = []
 
     def reset_admission_history(self):
         self.entropy_list = []
@@ -83,6 +88,10 @@ class TTA(nn.Module):
         self.last_crsff_diag = {}
         self.last_spatial_anchor_probability_bank = None
         self.last_spatial_memory_names = []
+        self.last_localcorr_query_feature = None
+        self.last_localcorr_retrieved_features = None
+        self.last_localcorr_retrieved_names = []
+        self.last_localcorr_retrieved_similarities = []
         b,c,w,h = latent_model.shape
         sup_pixel = w
         latent_model = latent_model.reshape(b,c,int(w/sup_pixel),sup_pixel,int(h/sup_pixel),sup_pixel)
@@ -116,6 +125,14 @@ class TTA(nn.Module):
             self.pool.anchor_probability_bank.detach()
             if self.pool.anchor_probability_bank is not None else None)
         self.last_spatial_memory_names = list(self.pool.name_list)
+        # EXP7_LOCALCORR_DIAG: freeze the exact pre-update query/memory feature view.
+        self.last_localcorr_query_feature = latent_feature_map[0].detach()
+        if fff is not None and out_image is not None:
+            self.last_localcorr_retrieved_features = fff[0].detach().reshape(-1, c, w, h)
+        else:
+            self.last_localcorr_retrieved_features = None
+        self.last_localcorr_retrieved_names = list(retrieval_names)
+        self.last_localcorr_retrieved_similarities = list(retrieval_diag.get('similarities', []))
 
         # EXP0_REPRO: SFF-only retains the source-BN path; SABE-only keeps
         # the enhanced batch but discards the feature-fusion replacement.
