@@ -56,6 +56,9 @@ class TTA(nn.Module):
         self.last_gated_sff_feature = None
         # EXP6_CRSFF: read-only diagnostic state for the fusion-weight experiment.
         self.last_crsff_diag = {}
+        # EXP6_5_SPATIAL_DIAG: pre-update snapshot for offline geometry only.
+        self.last_spatial_anchor_probability_bank = None
+        self.last_spatial_memory_names = []
 
     def reset_admission_history(self):
         self.entropy_list = []
@@ -78,6 +81,8 @@ class TTA(nn.Module):
         self.last_released_sff_feature = None
         self.last_gated_sff_feature = None
         self.last_crsff_diag = {}
+        self.last_spatial_anchor_probability_bank = None
+        self.last_spatial_memory_names = []
         b,c,w,h = latent_model.shape
         sup_pixel = w
         latent_model = latent_model.reshape(b,c,int(w/sup_pixel),sup_pixel,int(h/sup_pixel),sup_pixel)
@@ -104,6 +109,13 @@ class TTA(nn.Module):
         self.last_class_memory_prototypes = self.pool.class_prototype_bank
         self.last_class_memory_masses = self.pool.class_mass_bank
         self.last_class_memory_names = list(self.pool.name_list)
+        # EXP6_5_SPATIAL_DIAG: preserve the exact retrieval-time bank view.
+        # The pool may be FIFO-updated later in this same forward; cloning is
+        # deliberately avoided because this is a read-only tensor snapshot.
+        self.last_spatial_anchor_probability_bank = (
+            self.pool.anchor_probability_bank.detach()
+            if self.pool.anchor_probability_bank is not None else None)
+        self.last_spatial_memory_names = list(self.pool.name_list)
 
         # EXP0_REPRO: SFF-only retains the source-BN path; SABE-only keeps
         # the enhanced batch but discards the feature-fusion replacement.
@@ -150,6 +162,7 @@ class TTA(nn.Module):
                                                        self.last_class_masses)
             reliability, soft_mass = self._anchor_class_reliability(self.last_anchor_probability)
             self.pool.update_reliability_pool(reliability, soft_mass)
+            self.pool.update_anchor_probability_pool(self.last_anchor_probability)
         self.pool.validate_synchronized_banks()
         if out_image is not None:
             if self.use_sabe:
@@ -609,6 +622,8 @@ class Prototype_Pool(nn.Module):
         # EXP6_CRSFF: metadata banks mirror the actual released pool behavior.
         self.class_reliability_bank = torch.empty((0, 3)).cuda()
         self.class_soft_mass_bank = torch.empty((0, 3)).cuda()
+        # EXP6_5_SPATIAL_DIAG: anchor probability maps are diagnostic-only.
+        self.anchor_probability_bank = None
         # EXP0_5_DIAG: retrieval metadata only; it is not consumed by the method.
         self.last_retrieval_diag = {'indices': [], 'similarities': []}
     def get_pool_feature(self, x, mask, top_k = 5):
@@ -703,8 +718,23 @@ class Prototype_Pool(nn.Module):
             self.class_soft_mass_bank = torch.cat([self.class_soft_mass_bank[-self.max_length:], soft_mass], dim=0)
 
     def validate_synchronized_banks(self):
-        # EXP6_CRSFF: stop immediately if metadata and released memory banks diverge.
+        # EXP6_CRSFF / EXP6_5_SPATIAL_DIAG: stop if any bank diverges.
+        anchor_length = (0 if self.anchor_probability_bank is None
+                         else self.anchor_probability_bank.shape[0])
         lengths = [self.feature_bank.shape[0], self.image_bank.shape[0], self.mask_bank.shape[0],
-                   len(self.name_list), self.class_reliability_bank.shape[0], self.class_soft_mass_bank.shape[0]]
+                   len(self.name_list), self.class_reliability_bank.shape[0],
+                   self.class_soft_mass_bank.shape[0], anchor_length]
         if len(set(int(length) for length in lengths)) != 1:
             raise RuntimeError(f'EXP6_CRSFF bank desynchronization: {lengths}')
+
+    def update_anchor_probability_pool(self, probability):
+        # EXP6_5_SPATIAL_DIAG: mirror the actual feature FIFO exactly.
+        probability = probability.detach()
+        if self.anchor_probability_bank is None:
+            self.anchor_probability_bank = probability.clone()
+        elif self.anchor_probability_bank.shape[0] < self.max_length:
+            self.anchor_probability_bank = torch.cat(
+                [self.anchor_probability_bank, probability], dim=0)
+        else:
+            self.anchor_probability_bank = torch.cat(
+                [self.anchor_probability_bank[-self.max_length:], probability], dim=0)
