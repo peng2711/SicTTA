@@ -29,7 +29,7 @@ from run_exp0 import ProcessedStream, assd, dice, json_safe, load_model  # noqa:
 
 DOMAINS = ["B", "C", "D"]
 CLASSES = [(1, "lv"), (2, "myo"), (3, "rv")]
-VARIANTS = ("released", "identity", "zero_hard", "mad_hard", "mad_soft")
+VARIANTS = ("released", "identity", "zero_hard", "mad_hard", "mad_soft", "mad_soft_no_rv")
 EPS = 1e-8
 FIELDS = [
     "variant", "seed", "global_index", "domain", "volume_id", "slice_name", "z_index",
@@ -101,7 +101,7 @@ class ConfidenceDeltaSelector:
             robust_z.append(z_value)
             if self.variant == "zero_hard":
                 gates[index] = float(value >= 0.0)
-            elif self.variant in {"mad_hard", "mad_soft"} and history_len_before >= self.warmup:
+            elif self.variant in {"mad_hard", "mad_soft", "mad_soft_no_rv"} and history_len_before >= self.warmup:
                 if self.variant == "mad_hard":
                     gates[index] = float(z_value >= -self.robust_lambda)
                 else:
@@ -109,6 +109,11 @@ class ConfidenceDeltaSelector:
                     # only after crossing the robust lower-tail threshold.
                     argument = np.clip((z_value + self.robust_lambda) / self.temperature, -40.0, 0.0)
                     gates[index] = float(np.exp(argument))
+
+        # Time-boxed EXP-9 diagnostic: preserve the released path for RV and
+        # allow confidence-delta selection only for LV/MYO.
+        if self.variant == "mad_soft_no_rv":
+            gates[2] = 1.0
 
         # Background remains on the adapted path.  Anchor posterior mass turns
         # class decisions into one valid spatial convex mixture.

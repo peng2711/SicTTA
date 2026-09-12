@@ -159,6 +159,20 @@ def build_report(overall, class_summary, gate_summary, pairwise):
             best = max(decision_rows, key=lambda item: item[2])
             lines.append(f"Best variant: **{best[0]}**, seed={best[1]}, delta={best[2]:+.4f} pp.")
             lines.append("GO threshold: +0.15 pp and paired-case 95% CI excluding zero.")
+            no_rv = class_summary[
+                (class_summary.variant == "mad_soft_no_rv")
+                & (class_summary.seed == 2026)
+                & (class_summary.domain == "All")
+                & (class_summary["class"].isin(["lv", "myo"]))
+            ]
+            if len(no_rv) == 2:
+                lv_myo_delta = no_rv.mean_delta_pp.mean()
+                decision = "GO" if lv_myo_delta > 0.15 else "STOP"
+                lines.append(
+                    "Time-boxed No-RV diagnostic: "
+                    f"LV/MYO mean delta={lv_myo_delta:+.4f} pp; "
+                    f"required >+0.15 pp. Decision: **{decision}**."
+                )
         else:
             lines.append("No selector variant is available for a decision.")
         lines.append("")
